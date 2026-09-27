@@ -54,6 +54,22 @@ class Repository:
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
                 );
+                CREATE TABLE IF NOT EXISTS statements (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    witness TEXT NOT NULL,
+                    position TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    verdict TEXT CHECK(verdict IN ('consistent','conflict','undetermined')),
+                    review_note TEXT,
+                    reviewed_by TEXT,
+                    reviewed_at TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(item_id, witness, position)
+                );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     action TEXT NOT NULL,
@@ -156,6 +172,75 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def get_statement(self, statement_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM statements WHERE id=?", (statement_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("陈述不存在")
+        return dict(row)
+
+    def list_statements(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM statements WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_statement(self, item_id: int, witness: str, position: str,
+                         content: str, actor: str) -> tuple:
+        """登记陈述；同一证人同一位置重复提交时版本递增并使原复核失效。"""
+        now = utc_now()
+        self.get_item(item_id)
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT * FROM statements WHERE item_id=? AND witness=? AND position=?",
+                (item_id, witness, position)).fetchone()
+            if row is None:
+                cur = self.conn.execute(
+                    """INSERT INTO statements(item_id, witness, position, content, version,
+                       created_by, created_at, updated_at) VALUES(?,?,?,?,1,?,?,?)""",
+                    (item_id, witness, position, content, actor, now, now),
+                )
+                statement_id = int(cur.lastrowid)
+                invalidated = False
+            else:
+                statement_id = int(row["id"])
+                invalidated = row["verdict"] is not None
+                self.conn.execute(
+                    """UPDATE statements SET content=?, version=version+1, verdict=NULL,
+                       review_note=NULL, reviewed_by=NULL, reviewed_at=NULL, updated_at=?
+                       WHERE id=?""",
+                    (content, now, statement_id),
+                )
+        return self.get_statement(statement_id), invalidated
+
+    def review_statement(self, statement_id: int, verdict: str, note: str,
+                         actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE statements SET verdict=?, review_note=?, reviewed_by=?,
+                   reviewed_at=? WHERE id=?""",
+                (verdict, note, actor, now, statement_id),
+            )
+            if cur.rowcount == 0:
+                raise NotFoundError("陈述不存在")
+        return self.get_statement(statement_id)
+
+    def statement_summary(self, item_id: int) -> Dict[str, Any]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM statements WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
+        pending = [{"id": r["id"], "witness": r["witness"], "position": r["position"]}
+                   for r in rows if r["verdict"] is None]
+        conflicts = [{"id": r["id"], "witness": r["witness"], "position": r["position"],
+                      "review_note": r["review_note"]}
+                     for r in rows if r["verdict"] == "conflict"]
+        return {"total": len(rows), "pending_review": pending, "conflicts": conflicts}
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:

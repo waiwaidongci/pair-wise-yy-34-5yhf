@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (STATEMENT_VERDICTS, NotFoundError, ValidationError,
+                     ensure_role, normalize_severity, require_number,
+                     require_text)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
-                    validate_transition)
+from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES,
+                    STATEMENT_REVIEW_ROLES, STATEMENT_ROLES, TITLE, VIEW_ROLES,
+                    completion_blockers, escalation_required, priority_score,
+                    response_deadline_hours, role_for_transition,
+                    statement_blockers, validate_transition)
 
 
 class Service:
@@ -55,6 +58,45 @@ class Service:
         })
         return record
 
+    def submit_statement(self, item_id: int, payload: Dict[str, Any], actor: str,
+                         role: str) -> Dict[str, Any]:
+        ensure_role(role, STATEMENT_ROLES)
+        actor = require_text(actor, "actor", 100)
+        witness = require_text(payload.get("witness"), "witness", 100)
+        position = require_text(payload.get("position"), "position", 200)
+        content = require_text(payload.get("content"), "content")
+        statement, invalidated = self.repository.upsert_statement(
+            item_id, witness, position, content, actor)
+        self.repository.append_audit("statement", ENTITY, item_id, actor, {
+            "statement_id": statement["id"], "witness": witness,
+            "position": position, "version": statement["version"],
+            "content": content, "review_invalidated": invalidated,
+        })
+        return statement
+
+    def review_statement(self, item_id: int, statement_id: int,
+                         payload: Dict[str, Any], actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, STATEMENT_REVIEW_ROLES)
+        actor = require_text(actor, "actor", 100)
+        verdict = payload.get("verdict")
+        if verdict not in STATEMENT_VERDICTS:
+            raise ValidationError("verdict必须是consistent、conflict或undetermined")
+        note = require_text(payload.get("note"), "note")
+        statement = self.repository.get_statement(statement_id)
+        if statement["item_id"] != item_id:
+            raise NotFoundError("陈述不存在")
+        statement = self.repository.review_statement(statement_id, verdict, note, actor)
+        self.repository.append_audit("statement_review", ENTITY, item_id, actor, {
+            "statement_id": statement["id"], "witness": statement["witness"],
+            "position": statement["position"], "version": statement["version"],
+            "verdict": verdict, "note": note,
+        })
+        return statement
+
+    def list_statements(self, item_id: int, role: str) -> list:
+        self._view(role)
+        return self.repository.list_statements(item_id)
+
     def transition(self, item_id: int, target: str, expected_version: int,
                    actor: str, role: str) -> Dict[str, Any]:
         actor = require_text(actor, "actor", 100)
@@ -64,6 +106,7 @@ class Service:
         if not isinstance(expected_version, int) or expected_version < 1:
             raise ValueError("expected_version必须是正整数")
         blockers = completion_blockers(target, self.repository.open_record_count(item_id))
+        blockers += statement_blockers(target, self.repository.statement_summary(item_id))
         if blockers:
             from .domain import ConflictError
             raise ConflictError("；".join(blockers))
@@ -91,8 +134,7 @@ class Service:
         ensure_role(role, AUDIT_ROLES)
         return self.repository.list_audit(item_id)
 
-    @staticmethod
-    def enrich(item: Dict[str, Any]) -> Dict[str, Any]:
+    def enrich(self, item: Dict[str, Any]) -> Dict[str, Any]:
         result = dict(item)
         result["priority"] = priority_score(
             item["severity"], item["quantity"], item["threshold"])
@@ -100,4 +142,5 @@ class Service:
             item["severity"], item["quantity"], item["threshold"])
         result["escalation_required"] = escalation_required(
             item["severity"], item["quantity"], item["threshold"])
+        result["statement_summary"] = self.repository.statement_summary(item["id"])
         return result
