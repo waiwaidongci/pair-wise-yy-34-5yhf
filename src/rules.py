@@ -3,6 +3,7 @@ from .domain import ConflictError, ValidationError
 TITLE='工伤事故调查与纠正措施'; ENTITY='事故'; ID_PREFIX='OI'
 SEVERITIES=['minor', 'moderate', 'serious', 'fatal']; STATES=['reported', 'investigating', 'corrective_action', 'verification', 'closed']; TRANSITIONS={'reported': ['investigating'], 'investigating': ['corrective_action'], 'corrective_action': ['verification'], 'verification': ['closed'], 'closed': []}; TRANSITION_ROLES={'investigating': ['investigator'], 'corrective_action': ['investigator'], 'verification': ['safety_manager'], 'closed': ['safety_manager']}
 CREATE_ROLES=set(['reporter', 'investigator']); RECORD_ROLES=set(['investigator', 'safety_manager']); AUDIT_ROLES=set(['safety_manager', 'viewer']); VIEW_ROLES=set(['reporter', 'investigator', 'safety_manager', 'viewer'])
+STATEMENT_ROLES=set(['investigator']); REVIEW_ROLES=set(['safety_manager']); STATEMENT_VERDICTS=['consistent', 'conflicting', 'undeterminable']
 SEVERITY_WEIGHT={'minor': 1.0, 'moderate': 3.0, 'serious': 6.0, 'fatal': 9.0}; DEADLINE_HOURS={'minor': 72, 'moderate': 24, 'serious': 8, 'fatal': 4}; TERMINAL_STATES=set(['closed'])
 def priority_score(severity,quantity=0.0,threshold=1.0,open_records=0):
     if severity not in SEVERITY_WEIGHT: raise ValidationError("unknown severity")
@@ -20,3 +21,22 @@ def validate_transition(current,target):
     if not can_transition(current,target): raise ConflictError(f"不能从{current}转换到{target}")
 def completion_blockers(target,open_records): return ["仍有未关闭事项"] if target in TERMINAL_STATES and open_records>0 else []
 def role_for_transition(target): return set(TRANSITION_ROLES.get(target,[]))
+def statement_status(statement):
+    if not statement.get("is_current"): return "superseded"
+    review=statement.get("review")
+    return review["verdict"] if review else "pending"
+def statement_summary(statements):
+    summary={"total":0,"pending":0,"consistent":0,"conflicting":0,"undeterminable":0,"pending_witnesses":[],"conflict_items":[]}
+    for statement in statements:
+        status=statement_status(statement)
+        if status=="superseded": continue
+        summary["total"]+=1; summary[status]+=1
+        if status=="pending": summary["pending_witnesses"].append({"statement_id":statement["id"],"witness_name":statement["witness_name"],"position":statement["position"]})
+        elif status=="conflicting": summary["conflict_items"].append({"statement_id":statement["id"],"witness_name":statement["witness_name"],"position":statement["position"],"content":statement["content"]})
+    return summary
+def statement_blockers(summary):
+    blockers=[]
+    if summary.get("conflicting",0)>0: blockers.append(f"存在{summary['conflicting']}条冲突陈述")
+    if summary.get("undeterminable",0)>0: blockers.append(f"存在{summary['undeterminable']}条无法判断的陈述")
+    if summary.get("pending",0)>0: blockers.append(f"存在{summary['pending']}条未复核陈述")
+    return blockers

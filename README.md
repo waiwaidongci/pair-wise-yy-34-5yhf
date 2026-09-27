@@ -30,9 +30,19 @@ python3 app.py --db ./data.db --port 8311
 - `GET /api/items/{id}`
 - `POST /api/items/{id}/records`
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
+- `GET /api/items/{id}/statements`
+- `POST /api/items/{id}/statements`，按`witness_name`+`position`登记原话，重复提交升版本
+- `POST /api/items/{id}/statements/{sid}/review`，提交`verdict`与`note`
 - `GET /api/audit`
 
 允许角色：reporter, investigator, safety_manager, viewer。严重度越高、伤害指数越大或未关闭措施越多，优先级越高；严重事故必须在4小时内启动调查。
+
+## 现场陈述
+
+- 调查员（investigator）按证人和观察位置分别登记原话；同一证人同一位置重复提交时保留新版本，旧版本及其复核随即失效。
+- 安全员（safety_manager）逐条复核，结论为`consistent`（一致）、`conflicting`（冲突）或`undeterminable`（无法判断），并填写复核说明。
+- 存在冲突、无法判断或未复核的陈述时，事故不能进入`verification`。
+- 事故详情和列表中的`statement_summary`显示待复核人（`pending_witnesses`）与冲突项（`conflict_items`）。
 
 ## 测试
 

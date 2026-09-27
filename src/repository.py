@@ -65,6 +65,28 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS statements (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    witness_name TEXT NOT NULL,
+                    position TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    is_current INTEGER NOT NULL DEFAULT 1,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(item_id, witness_name, position, version)
+                );
+                CREATE TABLE IF NOT EXISTS statement_reviews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    statement_id INTEGER NOT NULL REFERENCES statements(id) ON DELETE CASCADE,
+                    verdict TEXT NOT NULL
+                        CHECK(verdict IN ('consistent','conflicting','undeterminable')),
+                    note TEXT NOT NULL,
+                    valid INTEGER NOT NULL DEFAULT 1,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
             """)
 
     @staticmethod
@@ -156,6 +178,89 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def add_statement(self, item_id: int, witness_name: str, position: str,
+                      content: str, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        self.get_item(item_id)
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                """SELECT id, version FROM statements
+                   WHERE item_id=? AND witness_name=? AND position=? AND is_current=1""",
+                (item_id, witness_name, position),
+            ).fetchone()
+            version = 1
+            if row is not None:
+                version = int(row["version"]) + 1
+                self.conn.execute(
+                    "UPDATE statements SET is_current=0 WHERE id=?", (row["id"],))
+                self.conn.execute(
+                    "UPDATE statement_reviews SET valid=0 WHERE statement_id=? AND valid=1",
+                    (row["id"],))
+            cur = self.conn.execute(
+                """INSERT INTO statements(item_id, witness_name, position, content,
+                   version, is_current, created_by, created_at)
+                   VALUES(?,?,?,?,?,1,?,?)""",
+                (item_id, witness_name, position, content, version, actor, now),
+            )
+            statement_id = int(cur.lastrowid)
+        return self.get_statement(statement_id)
+
+    def get_statement(self, statement_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM statements WHERE id=?", (statement_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("陈述不存在")
+        statement = dict(row)
+        statement["is_current"] = bool(statement["is_current"])
+        return statement
+
+    def list_statements(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM statements WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
+            review_rows = self.conn.execute(
+                """SELECT r.* FROM statement_reviews r
+                   JOIN statements s ON s.id=r.statement_id
+                   WHERE s.item_id=? AND r.valid=1""",
+                (item_id,),
+            ).fetchall()
+        reviews = {row["statement_id"]: dict(row) for row in review_rows}
+        result = []
+        for row in rows:
+            statement = dict(row)
+            statement["is_current"] = bool(statement["is_current"])
+            review = reviews.get(statement["id"])
+            if review is not None:
+                review["valid"] = bool(review["valid"])
+            statement["review"] = review
+            result.append(statement)
+        return result
+
+    def add_statement_review(self, statement_id: int, verdict: str, note: str,
+                             actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        statement = self.get_statement(statement_id)
+        if not statement["is_current"]:
+            raise ConflictError("该陈述已被新版本取代，相关复核已失效")
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE statement_reviews SET valid=0 WHERE statement_id=? AND valid=1",
+                (statement_id,))
+            cur = self.conn.execute(
+                """INSERT INTO statement_reviews(statement_id, verdict, note, valid,
+                   created_by, created_at) VALUES(?,?,?,1,?,?)""",
+                (statement_id, verdict, note, actor, now),
+            )
+            review_id = int(cur.lastrowid)
+            row = self.conn.execute(
+                "SELECT * FROM statement_reviews WHERE id=?", (review_id,)).fetchone()
+        review = dict(row)
+        review["valid"] = bool(review["valid"])
+        return review
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:

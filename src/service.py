@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .domain import (ensure_role, normalize_severity, normalize_verdict,
+                     require_number, require_text)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
-                    validate_transition)
+from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES,
+                    REVIEW_ROLES, STATEMENT_ROLES, TITLE, VIEW_ROLES,
+                    completion_blockers, escalation_required, priority_score,
+                    response_deadline_hours, role_for_transition,
+                    statement_blockers, statement_summary, validate_transition)
 
 
 class Service:
@@ -64,6 +66,8 @@ class Service:
         if not isinstance(expected_version, int) or expected_version < 1:
             raise ValueError("expected_version必须是正整数")
         blockers = completion_blockers(target, self.repository.open_record_count(item_id))
+        if target == "verification":
+            blockers += statement_blockers(self._statement_summary(item_id))
         if blockers:
             from .domain import ConflictError
             raise ConflictError("；".join(blockers))
@@ -74,6 +78,45 @@ class Service:
                 item["severity"], item["quantity"], item["threshold"]),
         })
         return self.enrich(updated)
+
+    def add_statement(self, item_id: int, payload: Dict[str, Any], actor: str,
+                      role: str) -> Dict[str, Any]:
+        ensure_role(role, STATEMENT_ROLES)
+        actor = require_text(actor, "actor", 100)
+        witness_name = require_text(payload.get("witness_name"), "witness_name", 100)
+        position = require_text(payload.get("position"), "position", 200)
+        content = require_text(payload.get("content"), "content")
+        statement = self.repository.add_statement(item_id, witness_name, position,
+                                                  content, actor)
+        self.repository.append_audit("statement", ENTITY, item_id, actor, {
+            "statement_id": statement["id"], "witness_name": witness_name,
+            "position": position, "version": statement["version"],
+        })
+        return statement
+
+    def review_statement(self, item_id: int, statement_id: int, payload: Dict[str, Any],
+                         actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, REVIEW_ROLES)
+        actor = require_text(actor, "actor", 100)
+        verdict = normalize_verdict(payload.get("verdict"))
+        note = require_text(payload.get("note"), "note")
+        statement = self.repository.get_statement(statement_id)
+        if statement["item_id"] != item_id:
+            from .domain import NotFoundError
+            raise NotFoundError("陈述不存在")
+        review = self.repository.add_statement_review(statement_id, verdict, note, actor)
+        self.repository.append_audit("statement_review", ENTITY, item_id, actor, {
+            "statement_id": statement_id, "review_id": review["id"],
+            "verdict": verdict,
+        })
+        return review
+
+    def list_statements(self, item_id: int, role: str) -> list:
+        self._view(role)
+        return self.repository.list_statements(item_id)
+
+    def _statement_summary(self, item_id: int) -> Dict[str, Any]:
+        return statement_summary(self.repository.list_statements(item_id))
 
     def get_item(self, item_id: int, role: str) -> Dict[str, Any]:
         self._view(role)
@@ -91,8 +134,7 @@ class Service:
         ensure_role(role, AUDIT_ROLES)
         return self.repository.list_audit(item_id)
 
-    @staticmethod
-    def enrich(item: Dict[str, Any]) -> Dict[str, Any]:
+    def enrich(self, item: Dict[str, Any]) -> Dict[str, Any]:
         result = dict(item)
         result["priority"] = priority_score(
             item["severity"], item["quantity"], item["threshold"])
@@ -100,4 +142,5 @@ class Service:
             item["severity"], item["quantity"], item["threshold"])
         result["escalation_required"] = escalation_required(
             item["severity"], item["quantity"], item["threshold"])
+        result["statement_summary"] = self._statement_summary(item["id"])
         return result
